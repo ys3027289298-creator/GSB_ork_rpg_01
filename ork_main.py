@@ -4,7 +4,8 @@
 import os
 import random
 import sys
-from ork_core import Player, Enemy, combat, save_game, load_game
+from ork_core import (Player, Enemy, combat, save_game, load_game,
+                      handle_death, SAVE_DIR, SAVE_PATH)
 from ork_data import TEXTS, ENEMIES, QUESTS, LOCATIONS
 
 def clear_screen():
@@ -50,7 +51,7 @@ def action_farm(player):
     print(f"{t['GET_GOLD']}: {gold}")
     # Chance for item
     if random.random() < 0.3:
-        player.potions += 1
+        player.pickup_item('Potion')
         print(f"{t['GET_ITEM']}: Potion")
     player.day += 1
     wait_input()
@@ -76,9 +77,7 @@ def action_hunt(player):
     result = combat(player, enemy)
     
     if result == 'LOSE':
-        player.hp = 10
-        player.gold = max(0, player.gold // 2)
-        player.location = 'LOC_HOME'
+        handle_death(player)
         print("You woke up beaten at the tent. Lost half gold.")
         wait_input()
     elif result == 'RUN':
@@ -157,9 +156,7 @@ def action_dungeon(player):
     
     result = combat(player, enemy)
     if result == 'LOSE':
-        player.hp = 10
-        player.gold = max(0, player.gold // 2)
-        player.location = 'LOC_HOME'
+        handle_death(player)
         print("You woke up beaten at the tent. Lost half gold.")
     else:
         player.day += 1
@@ -228,7 +225,10 @@ def main_menu():
         if load_game(p):
             return p
         else:
-            print(t['NO_SAVES'])
+            # load_game already reports a corrupt save; only mention
+            # "no saves" when the file is genuinely absent.
+            if not os.path.exists(SAVE_PATH):
+                print(t['NO_SAVES'])
             wait_input()
             return main_menu() # Retry
     else:
@@ -236,7 +236,7 @@ def main_menu():
 
 def main():
     # Ensure saves folder exists
-    os.makedirs('saves', exist_ok=True)
+    os.makedirs(SAVE_DIR, exist_ok=True)
     
     player = main_menu()
     
@@ -245,6 +245,11 @@ def main():
 
     while True:
         clear_screen()
+        if not player.is_alive():
+            # Dead players cannot keep moving: respawn at the tent.
+            handle_death(player)
+            print("You woke up beaten at the tent. Lost half gold.")
+            wait_input()
         print_header(player)
         process_location(player)
         
