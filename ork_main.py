@@ -4,7 +4,7 @@
 import os
 import random
 import sys
-from ork_core import Player, Enemy, combat, save_game, load_game
+from ork_core import Player, Enemy, combat, save_game, load_game, handle_death
 from ork_data import TEXTS, ENEMIES, QUESTS, LOCATIONS
 
 def clear_screen():
@@ -76,9 +76,7 @@ def action_hunt(player):
     result = combat(player, enemy)
     
     if result == 'LOSE':
-        player.hp = 10
-        player.gold = max(0, player.gold // 2)
-        player.location = 'LOC_HOME'
+        handle_death(player)
         print("You woke up beaten at the tent. Lost half gold.")
         wait_input()
     elif result == 'RUN':
@@ -157,9 +155,7 @@ def action_dungeon(player):
     
     result = combat(player, enemy)
     if result == 'LOSE':
-        player.hp = 10
-        player.gold = max(0, player.gold // 2)
-        player.location = 'LOC_HOME'
+        handle_death(player)
         print("You woke up beaten at the tent. Lost half gold.")
     else:
         player.day += 1
@@ -246,6 +242,14 @@ def main():
     while True:
         clear_screen()
         print_header(player)
+        if not player.is_alive:
+            # Death guard: a dead player cannot move or act; respawn once
+            # at the tent with the gold penalty before continuing.
+            print(TEXTS[player.lang]['LOSE'])
+            handle_death(player)
+            print("You woke up beaten at the tent. Lost half gold.")
+            wait_input()
+            continue
         process_location(player)
         
         action = get_input("> ").upper()

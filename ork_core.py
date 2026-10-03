@@ -4,7 +4,100 @@
 import random
 import json
 import os
-from ork_data import TEXTS, ENEMIES, QUESTS
+from ork_data import TEXTS, ENEMIES, QUESTS, LOCATIONS
+
+# Save format version. Bump when Player.to_dict changes; old saves must be
+# rejected (or migrated) instead of being silently filled with defaults.
+SAVE_VERSION = 2
+
+# ork_data is the single source of truth: these schemas describe the shape
+# every record in ork_data must have, and are checked at the data boundary.
+ENEMY_REQUIRED_FIELDS = ('name_key', 'hp', 'dmg', 'xp', 'gold')
+ENEMY_NON_NEGATIVE_FIELDS = ('dmg', 'xp', 'gold')
+
+SAVE_REQUIRED_FIELDS = (
+    'save_version', 'name', 'hp', 'max_hp', 'dmg', 'lvl', 'xp', 'gold',
+    'potions', 'location', 'day', 'lang', 'active_quest', 'quest_progress',
+    'kills', 'items_collected',
+)
+
+
+class DataValidationError(ValueError):
+    """A static data record (enemy/item/quest) violates its schema.
+
+    Raised at the parsing boundary so a broken data file fails fast with a
+    message naming the entity and the bad field, instead of producing a
+    corrupt game state (or crashing later with a bare KeyError).
+    """
+
+
+class SaveDataError(DataValidationError):
+    """A save file is incomplete, outdated, or contains invalid state."""
+
+
+def known_items():
+    """All valid item ids, derived from ork_data (loot tables + Potion)."""
+    items = {'Potion'}
+    for loc in LOCATIONS.values():
+        for item in loc.get('loot', ()):
+            items.add(item)
+    return items
+
+
+# LOC_HOME is a runtime location (tent) not listed in LOCATIONS data.
+KNOWN_LOCATIONS = set(LOCATIONS) | {'LOC_HOME'}
+KNOWN_QUEST_IDS = {q['id'] for q in QUESTS}
+
+
+def _require_int(value, where, *, minimum=None):
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise DataValidationError(f'{where} must be an int, got {value!r}')
+    if minimum is not None and value < minimum:
+        raise DataValidationError(f'{where} must be >= {minimum}, got {value}')
+
+
+def validate_enemy(data, lang='RU'):
+    """Validate one enemy record from ork_data.ENEMIES."""
+    if not isinstance(data, dict):
+        raise DataValidationError(
+            f'enemy record must be a dict, got {type(data).__name__}')
+    ident = data.get('name_key', '<? enemy ?>')
+    missing = [f for f in ENEMY_REQUIRED_FIELDS if f not in data]
+    if missing:
+        raise DataValidationError(
+            f"enemy {ident!r} is missing required field(s): {', '.join(missing)}")
+    for field in ('hp',) + ENEMY_NON_NEGATIVE_FIELDS:
+        _require_int(data[field], f"enemy {ident!r} field {field!r}",
+                     minimum=1 if field == 'hp' else 0)
+    if not isinstance(data['name_key'], str):
+        raise DataValidationError(f"enemy field 'name_key' must be a string")
+    if data['name_key'] not in TEXTS.get(lang, {}):
+        raise DataValidationError(
+            f"enemy name_key {data['name_key']!r} has no {lang!r} localization")
+
+
+def validate_item(item):
+    """Validate an item id against the ork_data loot tables."""
+    if not isinstance(item, str) or item not in known_items():
+        raise DataValidationError(
+            f'unknown item {item!r}; known items: {sorted(known_items())}')
+
+
+def compute_attack_damage(player):
+    """Attack formula with bounded output: damage is always >= 0.
+
+    A negative/zero dmg stat must never let an "attack" heal the enemy.
+    """
+    base = max(0, player.dmg) + random.randint(0, 2)
+    crit = random.random() < 0.2
+    return (int(base * 1.5) if crit else base), crit
+
+
+def handle_death(player):
+    """Respawn a defeated player at the tent with the gold penalty."""
+    player.hp = 10
+    player.gold = max(0, player.gold // 2)
+    player.location = 'LOC_HOME'
 
 class Character:
     def __init__(self, name, hp, dmg):
@@ -31,8 +124,21 @@ class Player(Character):
     def get_text(self, key):
         return TEXTS[self.lang].get(key, key)
 
+    @property
+    def is_alive(self):
+        return self.hp > 0
+
     def heal(self, amount):
         self.hp = min(self.hp + amount, self.max_hp)
+
+    def pickup_item(self, item):
+        """Collect a unique item. Returns True if picked up, False if already
+        present (duplicate pickups are rejected, never counted twice)."""
+        validate_item(item)
+        if item in self.items_collected:
+            return False
+        self.items_collected[item] = 1
+        return True
 
     def add_xp(self, amount):
         self.xp += amount
@@ -68,6 +174,7 @@ class Player(Character):
 
     def to_dict(self):
         return {
+            'save_version': SAVE_VERSION,
             'name': self.name,
             'hp': self.hp,
             'max_hp': self.max_hp,
@@ -86,28 +193,82 @@ class Player(Character):
         }
 
     def from_dict(self, data):
-        self.name = data.get('name', 'Ork')
-        self.hp = data.get('hp', 50)
-        self.max_hp = data.get('max_hp', 50)
-        self.dmg = data.get('dmg', 5)
-        self.lvl = data.get('lvl', 1)
-        self.xp = data.get('xp', 0)
-        self.gold = data.get('gold', 0)
-        self.potions = data.get('potions', 1)
-        self.location = data.get('location', 'LOC_FOREST')
-        self.day = data.get('day', 1)
-        self.lang = data.get('lang', 'RU')
-        self.active_quest = data.get('active_quest')
-        self.quest_progress = data.get('quest_progress', 0)
-        self.kills = data.get('kills', {})
-        self.items_collected = data.get('items_collected', {})
+        # Strict migration: a save must be complete and self-consistent.
+        # Silently defaulting missing/illegal fields is what makes the map and
+        # inventory disagree after exiting and re-entering.
+        if not isinstance(data, dict):
+            raise SaveDataError(f'save must be a JSON object, got {type(data).__name__}')
+        if data.get('save_version') != SAVE_VERSION:
+            raise SaveDataError(
+                f"unsupported save version {data.get('save_version')!r}; "
+                f'expected {SAVE_VERSION}')
+        missing = [f for f in SAVE_REQUIRED_FIELDS if f not in data]
+        if missing:
+            raise SaveDataError(
+                f'save is missing field(s): {", ".join(missing)}')
+
+        if not isinstance(data['name'], str) or not data['name']:
+            raise SaveDataError("save field 'name' must be a non-empty string")
+        _require_int(data['max_hp'], "save field 'max_hp'", minimum=1)
+        _require_int(data['hp'], "save field 'hp'", minimum=0)
+        if data['hp'] > data['max_hp']:
+            raise SaveDataError(
+                f"save field 'hp' ({data['hp']}) > max_hp ({data['max_hp']})")
+        _require_int(data['dmg'], "save field 'dmg'", minimum=0)
+        _require_int(data['lvl'], "save field 'lvl'", minimum=1)
+        _require_int(data['xp'], "save field 'xp'", minimum=0)
+        _require_int(data['gold'], "save field 'gold'", minimum=0)
+        _require_int(data['potions'], "save field 'potions'", minimum=0)
+        _require_int(data['day'], "save field 'day'", minimum=1)
+        _require_int(data['quest_progress'], "save field 'quest_progress'", minimum=0)
+        if data['lang'] not in TEXTS:
+            raise SaveDataError(f"unknown save language {data['lang']!r}")
+        if data['location'] not in KNOWN_LOCATIONS:
+            raise SaveDataError(
+                f"unknown save location {data['location']!r}; "
+                f'known: {sorted(KNOWN_LOCATIONS)}')
+        if not isinstance(data['items_collected'], dict):
+            raise SaveDataError("save field 'items_collected' must be an object")
+        for item, count in data['items_collected'].items():
+            validate_item(item)
+            _require_int(count, f"items_collected[{item!r}]", minimum=1)
+        if not isinstance(data['kills'], dict):
+            raise SaveDataError("save field 'kills' must be an object")
+        for enemy, count in data['kills'].items():
+            if not isinstance(enemy, str):
+                raise SaveDataError('kills keys must be strings')
+            _require_int(count, f'kills[{enemy!r}]', minimum=0)
+
+        quest = data['active_quest']
+        if quest is not None:
+            if not isinstance(quest, dict) or quest.get('id') not in KNOWN_QUEST_IDS:
+                raise SaveDataError(
+                    f"save field 'active_quest' is not a known quest: {quest!r}")
+
+        self.name = data['name']
+        self.hp = data['hp']
+        self.max_hp = data['max_hp']
+        self.dmg = data['dmg']
+        self.lvl = data['lvl']
+        self.xp = data['xp']
+        self.gold = data['gold']
+        self.potions = data['potions']
+        self.location = data['location']
+        self.day = data['day']
+        self.lang = data['lang']
+        self.active_quest = quest
+        self.quest_progress = data['quest_progress']
+        self.kills = data['kills']
+        self.items_collected = data['items_collected']
 
 class Enemy(Character):
     def __init__(self, data, lang):
+        validate_enemy(data, lang)
         name = TEXTS[lang][data['name_key']]
         super().__init__(name, data['hp'], data['dmg'])
         self.xp = data['xp']
         self.gold = data['gold']
+        self.name_key = data['name_key']
 
 def combat(player, enemy):
     t = TEXTS[player.lang]
@@ -120,9 +281,7 @@ def combat(player, enemy):
         action = input("> ").strip()
         
         if action == '1': # Attack
-            dmg = player.dmg + random.randint(0, 2)
-            crit = random.random() < 0.2
-            if crit: dmg = int(dmg * 1.5)
+            dmg, crit = compute_attack_damage(player)
             enemy.hp -= dmg
             print(f"{t['HIT']}: {dmg} {'(CRIT!)' if crit else ''}")
             
@@ -132,7 +291,7 @@ def combat(player, enemy):
                 enemy.hp -= 1 # Counter attack
             else:
                 print("Blocked but took scratch.")
-                player.hp -= enemy.dmg // 2
+                player.hp -= max(0, enemy.dmg) // 2
                 continue
                 
         elif action == '3': # Potion
@@ -156,7 +315,7 @@ def combat(player, enemy):
             
         # Enemy Turn
         if enemy.hp > 0:
-            player.hp -= enemy.dmg
+            player.hp -= max(0, enemy.dmg)
             print(f"{enemy.name} hits for {enemy.dmg}")
             
     if player.hp <= 0:
@@ -190,7 +349,11 @@ def load_game(player):
     try:
         with open('saves/save.json', 'r') as f:
             data = json.load(f)
-            player.from_dict(data)
-            return True
-    except:
+        player.from_dict(data)
+        return True
+    except FileNotFoundError:
+        return False
+    except (json.JSONDecodeError, DataValidationError) as e:
+        # Report corruption instead of silently starting from a bad state.
+        print(f"{player.get_text('SAVE_CORRUPT')} ({e})")
         return False
